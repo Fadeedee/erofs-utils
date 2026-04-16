@@ -1024,6 +1024,27 @@ static void erofs_rebuild_cleanup(void)
 	rebuild_src_count = 0;
 }
 
+static int erofs_rebuild_add_source(const char *path)
+{
+	struct erofs_sb_info *src;
+	int err;
+
+	src = calloc(1, sizeof(*src));
+	if (!src) {
+		erofs_rebuild_cleanup();
+		return -ENOMEM;
+	}
+	err = erofs_dev_open(src, path, O_RDONLY);
+	if (err) {
+		free(src);
+		erofs_rebuild_cleanup();
+		return err;
+	}
+	src->dev = ++rebuild_src_count;
+	list_add(&src->list, &rebuild_src_list);
+	return 0;
+}
+
 static int mkfs_parse_sources(int argc, char *argv[], int optind)
 {
 	struct stat st;
@@ -1104,25 +1125,11 @@ static int mkfs_parse_sources(int argc, char *argv[], int optind)
 
 	if (source_mode == EROFS_MKFS_SOURCE_REBUILD) {
 		char *srcpath = cfg.c_src_path;
-		struct erofs_sb_info *src;
 
 		do {
-			src = calloc(1, sizeof(struct erofs_sb_info));
-			if (!src) {
-				erofs_rebuild_cleanup();
-				return -ENOMEM;
-			}
-
-			err = erofs_dev_open(src, srcpath, O_RDONLY);
-			if (err) {
-				free(src);
-				erofs_rebuild_cleanup();
+			err = erofs_rebuild_add_source(srcpath);
+			if (err)
 				return err;
-			}
-
-			/* extra device index starts from 1 */
-			src->dev = ++rebuild_src_count;
-			list_add(&src->list, &rebuild_src_list);
 		} while (optind < argc && (srcpath = argv[optind++]));
 	} else if (optind < argc) {
 		erofs_err("unexpected argument: %s\n", argv[optind]);
@@ -2053,21 +2060,48 @@ int main(int argc, char **argv)
 				dataimport_mode == EROFS_MKFS_DATA_IMPORT_ZEROFILL);
 #endif
 #ifdef OCIEROFS_ENABLED
-		} else if (source_mode == EROFS_MKFS_SOURCE_OCI) {
-			ocicfg.image_ref = cfg.c_src_path;
-			if (mkfs_oci_tarindex_mode)
-				ocicfg.tarindex_path = strdup(cfg.c_src_path);
-			if (!ocicfg.zinfo_path)
-				ocicfg.zinfo_path = mkfs_aws_zinfo_file;
+	} else if (source_mode == EROFS_MKFS_SOURCE_OCI) {
+		struct ocierofs_build_result oci_res = {};
+		unsigned int j;
 
-			if (incremental_mode ||
-			    dataimport_mode == EROFS_MKFS_DATA_IMPORT_RVSP ||
-			    dataimport_mode == EROFS_MKFS_DATA_IMPORT_ZEROFILL)
-				err = -EOPNOTSUPP;
-			else
-				err = ocierofs_build_trees(&importer, &ocicfg);
+		ocicfg.image_ref = cfg.c_src_path;
+		if (mkfs_oci_tarindex_mode)
+			ocicfg.tarindex_path = strdup(cfg.c_src_path);
+		if (!ocicfg.zinfo_path)
+			ocicfg.zinfo_path = mkfs_aws_zinfo_file;
+
+		if (incremental_mode ||
+		    dataimport_mode == EROFS_MKFS_DATA_IMPORT_RVSP ||
+		    dataimport_mode == EROFS_MKFS_DATA_IMPORT_ZEROFILL)
+			err = -EOPNOTSUPP;
+		else
+			err = ocierofs_build_trees(&importer, &ocicfg, &oci_res);
+		if (err)
+			goto exit;
+
+		if (oci_res.erofs_layer_paths) {
+			for (j = 0; j < oci_res.erofs_layer_count; ++j) {
+				err = erofs_rebuild_add_source(oci_res.erofs_layer_paths[j]);
+				if (err)
+					break;
+			}
+			for (j = 0; j < oci_res.erofs_layer_count; ++j) {
+				if (!oci_res.erofs_layer_paths[j])
+					continue;
+				unlink(oci_res.erofs_layer_paths[j]);
+				free(oci_res.erofs_layer_paths[j]);
+			}
+			free(oci_res.erofs_layer_paths);
+			oci_res.erofs_layer_paths = NULL;
+			oci_res.erofs_layer_count = 0;
+
 			if (err)
 				goto exit;
+
+			err = erofs_mkfs_rebuild_load_trees(root);
+			if (err)
+				goto exit;
+		}
 #endif
 	}
 	if (err < 0)
@@ -2129,7 +2163,8 @@ exit:
 		fclose(blklst);
 	erofs_cleanup_compress_hints();
 	erofs_cleanup_exclude_rules();
-	if (cfg.c_chunkbits || source_mode == EROFS_MKFS_SOURCE_REBUILD)
+	if (cfg.c_chunkbits || source_mode == EROFS_MKFS_SOURCE_REBUILD ||
+	    (source_mode == EROFS_MKFS_SOURCE_OCI && rebuild_src_count > 0))
 		erofs_blob_exit();
 	erofs_xattr_cleanup_name_prefixes();
 	erofs_rebuild_cleanup();

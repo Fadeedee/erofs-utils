@@ -41,6 +41,21 @@ struct ocierofs_config {
 	bool insecure;
 };
 
+/*
+ * struct ocierofs_build_result - result of building from OCI image
+ * @erofs_layer_paths: array of temporary EROFS layer file paths
+ * @erofs_layer_count: number of entries in @erofs_layer_paths
+ *
+ * When the OCI image uses application/vnd.erofs.layer.v1 layers in index-only
+ * mode, mkfs will rebuild from these temporary EROFS images. The caller is
+ * responsible for unlinking and freeing @erofs_layer_paths after building its
+ * own rebuild source list.
+ */
+struct ocierofs_build_result {
+	char **erofs_layer_paths;
+	unsigned int erofs_layer_count;
+};
+
 struct ocierofs_layer_info {
 	char *digest;
 	char *media_type;
@@ -68,14 +83,19 @@ struct ocierofs_iostream {
 };
 
 /*
- * ocierofs_build_trees - Build file trees from OCI container image layers
- * @importer: erofs importer to populate
+ * ocierofs_build_trees - Build from OCI image and/or return EROFS layer paths
+ * @importer: erofs importer to populate for tar-based layers
  * @cfg:      oci configuration
+ * @res:      result of building from OCI image
  *
- * Return: 0 on success, negative errno on failure
+ * For tar-based layers, leaves @res empty and populates the importer directly.
+ * For EROFS naive layers (application/vnd.erofs.layer.v1) in index-only mode,
+ * downloads each layer blob into a temporary EROFS file and returns their
+ * paths via @res, for the caller to consume via the rebuild path.
  */
 int ocierofs_build_trees(struct erofs_importer *importer,
-			 const struct ocierofs_config *cfg);
+			const struct ocierofs_config *cfg,
+			struct ocierofs_build_result *res);
 int ocierofs_ctx_init(struct ocierofs_ctx *ctx,
 		      const struct ocierofs_config *cfg);
 void ocierofs_ctx_cleanup(struct ocierofs_ctx *ctx);

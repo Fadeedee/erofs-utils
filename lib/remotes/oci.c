@@ -40,8 +40,14 @@
 	"application/vnd.docker.distribution.manifest.list.v2+json"
 #define OCI_MEDIATYPE_MANIFEST "application/vnd.oci.image.manifest.v1+json"
 #define OCI_MEDIATYPE_INDEX "application/vnd.oci.image.index.v1+json"
+#define OCI_MEDIATYPE_EROFS_LAYER "application/vnd.erofs.layer.v1"
 
 #define OCIEROFS_IO_CHUNK_SIZE 32768
+
+static inline bool ocierofs_is_erofs_layer(const char *media_type)
+{
+	return media_type && !strcmp(media_type, OCI_MEDIATYPE_EROFS_LAYER);
+}
 
 struct ocierofs_request {
 	char *url;
@@ -1309,8 +1315,8 @@ void ocierofs_ctx_cleanup(struct ocierofs_ctx *ctx)
 	free(ctx->blob_digest);
 }
 
-int ocierofs_build_trees(struct erofs_importer *importer,
-			 const struct ocierofs_config *config)
+static int ocierofs_build_trees_from_tar(struct erofs_importer *importer,
+					 const struct ocierofs_config *config)
 {
 	struct ocierofs_ctx ctx = {};
 	int ret, i, end, fd;
@@ -1367,6 +1373,136 @@ out:
 	if (config->tarindex_path && importer->sbi)
 		importer->sbi->devs[0].blocks = BLK_ROUND_UP(importer->sbi, tar_offset);
 
+	ocierofs_ctx_cleanup(&ctx);
+	return ret;
+}
+
+static int ocierofs_download_erofs_layers(struct ocierofs_ctx *ctx,
+					  const struct ocierofs_config *config,
+					  struct ocierofs_build_result *res,
+					  int start, int end)
+{
+	char **paths;
+	int ret = 0;
+	int j;
+
+	paths = calloc(end - start, sizeof(char *));
+	if (!paths)
+		return -ENOMEM;
+
+	for (j = 0; j < end - start; ++j) {
+		int idx = start + j;
+		char tmpl[PATH_MAX];
+		const char *tmpdir;
+		int fd;
+
+		tmpdir = getenv("TMPDIR");
+		if (!tmpdir)
+			tmpdir = "/tmp";
+
+		if (snprintf(tmpl, sizeof(tmpl), "%s/ocierofs.XXXXXXXXXX",
+			     tmpdir) >= (int)sizeof(tmpl)) {
+			ret = -ENAMETOOLONG;
+			goto out_err;
+		}
+
+		fd = mkstemp(tmpl);
+		if (fd < 0) {
+			ret = -errno;
+			goto out_err;
+		}
+
+		ret = ocierofs_download_blob_to_fd(ctx, ctx->layers[idx]->digest,
+						   ctx->auth_header, fd);
+		close(fd);
+		if (ret) {
+			unlink(tmpl);
+			goto out_err;
+		}
+
+		paths[j] = strdup(tmpl);
+		if (!paths[j]) {
+			unlink(tmpl);
+			ret = -ENOMEM;
+			goto out_err;
+		}
+	}
+
+	res->erofs_layer_paths = paths;
+	res->erofs_layer_count = end - start;
+	return 0;
+
+out_err:
+	for (j = 0; j < end - start; ++j) {
+		if (!paths[j])
+			break;
+		unlink(paths[j]);
+		free(paths[j]);
+	}
+	free(paths);
+	return ret;
+}
+
+int ocierofs_build_trees(struct erofs_importer *importer,
+			const struct ocierofs_config *config,
+			struct ocierofs_build_result *res)
+{
+	struct ocierofs_ctx ctx = {};
+	int ret, i, end;
+	int j, n_erofs = 0, n_tar = 0;
+
+	res->erofs_layer_paths = NULL;
+	res->erofs_layer_count = 0;
+
+	ret = ocierofs_ctx_init(&ctx, config);
+	if (ret) {
+		ocierofs_ctx_cleanup(&ctx);
+		return ret;
+	}
+
+	if (ctx.blob_digest) {
+		i = ocierofs_find_layer_by_digest(&ctx, ctx.blob_digest);
+		if (i < 0) {
+			erofs_err("layer digest %s not found", ctx.blob_digest);
+			ret = -ENOENT;
+			goto out;
+		}
+		end = i + 1;
+	} else {
+		i = 0;
+		end = ctx.layer_count;
+	}
+
+	for (j = i; j < end; ++j) {
+		const char *mt = ctx.layers[j]->media_type;
+
+		if (ocierofs_is_erofs_layer(mt))
+			++n_erofs;
+		else
+			++n_tar;
+	}
+
+	if (!n_erofs) {
+		/* No EROFS layers: fall back to tar-based import. */
+		ocierofs_ctx_cleanup(&ctx);
+		return ocierofs_build_trees_from_tar(importer, config);
+	}
+
+	if (n_tar) {
+		erofs_err("mixed tar and EROFS layers not supported");
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	if (!config->tarindex_path) {
+		erofs_err("full image (--oci=f) with EROFS layers is not supported; use --oci=i for index-only");
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	ret = ocierofs_download_erofs_layers(&ctx, config, res, i, end);
+
+out:
 	ocierofs_ctx_cleanup(&ctx);
 	return ret;
 }
